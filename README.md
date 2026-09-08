@@ -11,6 +11,15 @@ It completely bypasses the broken default `libfprint` image-matching algorithm. 
 
 ---
 
+## ⚡ Recent Enhancements & Fixes
+
+* **Non-Blocking Async Architecture (`GThread`):** Moved USB capturing and heavy SIFT processing into dedicated background threads in `elan.c`, eliminating GLib main loop freezes and keeping `fprintd` / lock screen responsive.
+* **RAII LibUSB Lifecycle Management:** Added automatic kernel driver re-attachment (`libusb_attach_kernel_driver`) and safe interface release to prevent USB handle/interface leaks.
+* **Dynamic Noise Baselining:** Replaced static stddev noise thresholds with dynamic background noise sampling, ensuring reliable touch detection across dry/wet skin conditions.
+* **SIFT Descriptor Deduplication & Correct Matching:** Fixed KNN query/train matching order and added feature deduplication during multi-touch enrollment.
+
+---
+
 ## 🛑 The Problem
 The official Linux `libfprint` driver fails with this sensor because:
 1. It assumes the sensor is a "dumb" image provider.
@@ -20,7 +29,7 @@ The official Linux `libfprint` driver fails with this sensor because:
 I hacked the driver architecture:
 1. **Raw USB Capture:** I use `libusb` to send specific hex commands to wake up the sensor and grab the raw image buffer.
 2. **SIFT Feature Extraction:** Instead of standard minutiae, I use OpenCV's Scale-Invariant Feature Transform (SIFT). It finds unique micro-patterns on your fingerprint, regardless of the angle.
-3. **The "Super-Template":** During enrollment, the code waits for 5 separate touches and concatenates all unique keypoints into one massive reference template.
+3. **The "Super-Template":** During enrollment, the code waits for 5 separate touches, deduplicates descriptors, and concatenates unique keypoints into one reference template.
 4. **Fast Verification:** When unlocking, it takes 1 quick frame and compares it against the Super-Template using a strict K-Nearest Neighbors (KNN) matcher.
 
 ---
@@ -45,32 +54,40 @@ If you want to port this method to another unsupported sensor (e.g., Goodix, Egi
 **Requirements:** `libusb-1.0-0-dev`, `libopencv-dev`, `meson`, `ninja-build`
 
 1. Clone the official `libfprint` v1.94 repository:
+    ```bash
     git clone https://gitlab.freedesktop.org/libfprint/libfprint.git
     cd libfprint
     git checkout v1.94.1
+    ```
 
 2. Copy the files from this repo's `native_libfprint_driver` folder into your `libfprint` source code:
    * Put `elan.c`, `sift_engine.cpp`, and `sift_engine.h` into `libfprint/drivers/`.
    * Replace `libfprint/meson.build` and the root `meson.build` with the modified ones provided here.
 
 3. Build and install natively:
+    ```bash
     meson setup builddir --wipe
     ninja -C builddir
     sudo ninja -C builddir install
     sudo ldconfig
     sudo systemctl restart fprintd
+    ```
 
 4. **Important:** Clear your old broken prints first!
+    ```bash
     fprintd-delete "$USER"
+    ```
 
 5. Go to your KDE/GNOME system settings and enroll your fingerprint normally! (Touch the sensor 5 times during enrollment).
 
 ---
 
-## 🐍 Python PAM Script (Bonus)
-Check out the `python_pam_script/` folder for the initial prototype. It uses Python to do the exact same thing and hooks into the Linux PAM system. It's a great educational tool for reading and understanding the raw logic without compiling C++ code.
+## 🐍 Python Scripts
+* `elan_enroll.py`: Interactive CLI tool for enrolling 5 touches with finger-lift detection and CLAHE preprocessing.
+* `elan_verify.py`: Quick PAM/standalone verification script using SIFT matching.
 
 ---
-*Note: This text, as well as the comments in the driver algorithms, were generated with the assistance of AI during my reverse-engineering process.*
+
 ## Для русскоязычных пользователей
-Если у вас не работает сканер отпечатков пальцев ElanTech 04f3:0c4f в Linux (Ubuntu, Fedora, Mint) и стандартный драйвер libfprint выдает ошибку, этот репозиторий поможет решить проблему.
+Если у вас не работает сканер отпечатков пальцев ElanTech 04f3:0c4f в Linux (Ubuntu, Fedora, Mint) и стандартный драйвер libfprint выдает ошибку, этот репозиторий поможет решить проблему. Внесены исправления для предотвращения зависания системного интерфейса `fprintd` и корректного сопоставления отпечатков.
+

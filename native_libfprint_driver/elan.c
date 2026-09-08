@@ -2,6 +2,9 @@
 
 #include "drivers_api.h"
 #include "sift_engine.h"
+#include <glib.h>
+#include <stdlib.h>
+#include <string.h>
 
 struct _FpiDeviceElan {
     FpDevice parent;
@@ -19,59 +22,103 @@ static void elan_close(FpDevice *device) {
     fpi_device_close_complete(device, NULL);
 }
 
-// Отложенная функция для Enroll
-static gboolean elan_enroll_timeout(gpointer user_data) {
-    FpDevice *device = FP_DEVICE(user_data);
+/* ==================== ENROLL ASYNC WORKER ==================== */
+
+typedef struct {
+    FpDevice *device;
+    unsigned char *data;
+    int size;
+} EnrollTaskData;
+
+static gboolean elan_enroll_complete_idle(gpointer user_data) {
+    EnrollTaskData *task = (EnrollTaskData *)user_data;
     FpPrint *print = NULL;
-    fpi_device_get_enroll_data(device, &print);
-    
-    unsigned char *data = NULL;
-    int size = sift_engine_enroll(&data);
-    
-    if (size > 0 && print != NULL) {
-        GVariant *record = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, data, size, sizeof(guchar));
+    fpi_device_get_enroll_data(task->device, &print);
+
+    if (task->size > 0 && print != NULL) {
+        GVariant *record = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, task->data, task->size, sizeof(guchar));
         g_object_set(print, "fpi-type", FPI_PRINT_RAW, "fpi-data", record, NULL);
-        fpi_device_enroll_complete(device, g_object_ref(print), NULL);
-        free(data);
+        fpi_device_enroll_complete(task->device, g_object_ref(print), NULL);
     } else {
-        fpi_device_enroll_complete(device, NULL, fpi_device_error_new(FP_DEVICE_ERROR_GENERAL));
+        fpi_device_enroll_complete(task->device, NULL, fpi_device_error_new(FP_DEVICE_ERROR_GENERAL));
     }
+
+    if (task->data) free(task->data);
+    g_free(task);
     return G_SOURCE_REMOVE;
 }
 
-static void elan_enroll(FpDevice *device) {
-    // Ждем 100мс перед тем, как ответить
-    g_timeout_add(100, elan_enroll_timeout, device);
+static gpointer elan_enroll_worker_thread(gpointer user_data) {
+    EnrollTaskData *task = (EnrollTaskData *)user_data;
+    task->size = sift_engine_enroll(&task->data);
+    g_idle_add(elan_enroll_complete_idle, task);
+    return NULL;
 }
 
-// Отложенная функция для Verify
-static gboolean elan_verify_timeout(gpointer user_data) {
-    FpDevice *device = FP_DEVICE(user_data);
+static void elan_enroll(FpDevice *device) {
+    EnrollTaskData *task = g_new0(EnrollTaskData, 1);
+    task->device = device;
+    g_thread_new("elan-enroll-worker", elan_enroll_worker_thread, task);
+}
+
+/* ==================== VERIFY ASYNC WORKER ==================== */
+
+typedef struct {
+    FpDevice *device;
+    FpPrint *print;
+    unsigned char *saved_data;
+    int saved_size;
+    int match_result;
+} VerifyTaskData;
+
+static gboolean elan_verify_complete_idle(gpointer user_data) {
+    VerifyTaskData *task = (VerifyTaskData *)user_data;
+
+    fpi_device_verify_report(task->device,
+                             task->match_result ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
+                             task->match_result ? task->print : NULL,
+                             NULL);
+    fpi_device_verify_complete(task->device, NULL);
+
+    if (task->saved_data) g_free(task->saved_data);
+    g_free(task);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer elan_verify_worker_thread(gpointer user_data) {
+    VerifyTaskData *task = (VerifyTaskData *)user_data;
+    if (task->saved_data && task->saved_size > 0) {
+        task->match_result = sift_engine_verify(task->saved_data, task->saved_size);
+    } else {
+        task->match_result = 0;
+    }
+    g_idle_add(elan_verify_complete_idle, task);
+    return NULL;
+}
+
+static void elan_verify(FpDevice *device) {
     FpPrint *print = NULL;
     fpi_device_get_verify_data(device, &print);
-    
-    int match = 0;
+
+    VerifyTaskData *task = g_new0(VerifyTaskData, 1);
+    task->device = device;
+    task->print = print;
+
     if (print) {
         GVariant *record = NULL;
         g_object_get(print, "fpi-data", &record, NULL);
         if (record) {
-            gsize size;
-            const unsigned char *data = (const unsigned char *)g_variant_get_fixed_array(record, &size, sizeof(guchar));
-            match = sift_engine_verify(data, (int)size);
+            gsize size = 0;
+            const unsigned char *bytes = (const unsigned char *)g_variant_get_fixed_array(record, &size, sizeof(guchar));
+            if (bytes && size > 0) {
+                task->saved_data = (unsigned char *)g_memdup2(bytes, size);
+                task->saved_size = (int)size;
+            }
             g_variant_unref(record);
         }
     }
 
-    // Если совпало - отдаем отпечаток, если нет - отдаем NULL
-    fpi_device_verify_report(device, match ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL, match ? print : NULL, NULL);
-    fpi_device_verify_complete(device, NULL);
-    
-    return G_SOURCE_REMOVE;
-}
-
-static void elan_verify(FpDevice *device) {
-    // Ждем 100мс, даем fprintd проснуться
-    g_timeout_add(100, elan_verify_timeout, device);
+    g_thread_new("elan-verify-worker", elan_verify_worker_thread, task);
 }
 
 static const FpIdEntry elan_id_table[] = {
