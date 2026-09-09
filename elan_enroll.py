@@ -86,7 +86,15 @@ def main():
                         processed_img = process_image(img_8bit)
 
                         existing_files = [f for f in os.listdir(DIR) if f.startswith('template_') and f.endswith('.png')]
-                        next_idx = len(existing_files) + 1
+                        max_idx = 0
+                        for f in existing_files:
+                            try:
+                                idx = int(f[len('template_'):-len('.png')])
+                                if idx > max_idx:
+                                    max_idx = idx
+                            except ValueError:
+                                pass
+                        next_idx = max_idx + 1
                         save_path = os.path.join(DIR, f'template_{next_idx}.png')
 
                         cv2.imwrite(save_path, processed_img)

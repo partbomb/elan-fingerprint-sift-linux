@@ -58,7 +58,8 @@ static gpointer elan_enroll_worker_thread(gpointer user_data) {
 static void elan_enroll(FpDevice *device) {
     EnrollTaskData *task = g_new0(EnrollTaskData, 1);
     task->device = device;
-    g_thread_new("elan-enroll-worker", elan_enroll_worker_thread, task);
+    GThread *thread = g_thread_new("elan-enroll-worker", elan_enroll_worker_thread, task);
+    g_thread_unref(thread);
 }
 
 /* ==================== VERIFY ASYNC WORKER ==================== */
@@ -118,7 +119,8 @@ static void elan_verify(FpDevice *device) {
         }
     }
 
-    g_thread_new("elan-verify-worker", elan_verify_worker_thread, task);
+    GThread *thread = g_thread_new("elan-verify-worker", elan_verify_worker_thread, task);
+    g_thread_unref(thread);
 }
 
 static const FpIdEntry elan_id_table[] = {
@@ -134,7 +136,8 @@ static void fpi_device_elan_class_init(FpiDeviceElanClass *klass) {
     dev_class->type = FP_DEVICE_TYPE_USB;
     dev_class->id_table = elan_id_table;
     dev_class->scan_type = FP_SCAN_TYPE_PRESS;
-    dev_class->features = FP_DEVICE_FEATURE_VERIFY; 
+    dev_class->nr_enroll_stages = 1;
+    dev_class->features = FP_DEVICE_FEATURE_VERIFY | FP_DEVICE_FEATURE_ENROLL;
     
     dev_class->open = elan_open;
     dev_class->close = elan_close;

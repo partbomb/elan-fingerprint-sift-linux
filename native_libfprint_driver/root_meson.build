@@ -92,7 +92,6 @@ libversion = '@0@.@1@.@2@'.format(soversion, current, revision)
 versioned_libname = meson.project_name() + '-' + soversion.to_string()
 
 # Dependencies
-opencv_dep = dependency('opencv4')
 glib_dep = dependency('glib-2.0', version: '>=' + glib_min_version)
 gio_dep = dependency('gio-unix-2.0', version: '>=' + glib_min_version)
 gobject_dep = dependency('gobject-2.0', version: '>=' + glib_min_version)

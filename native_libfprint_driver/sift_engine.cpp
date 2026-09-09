@@ -19,6 +19,12 @@ public:
     bool kernel_detached = false;
     bool interface_claimed = false;
 
+    // Non-copyable, non-movable to prevent double-free
+    ScopedUsbDevice(const ScopedUsbDevice&) = delete;
+    ScopedUsbDevice& operator=(const ScopedUsbDevice&) = delete;
+    ScopedUsbDevice(ScopedUsbDevice&&) = delete;
+    ScopedUsbDevice& operator=(ScopedUsbDevice&&) = delete;
+
     ScopedUsbDevice(uint16_t vid, uint16_t pid) {
         if (libusb_init(&ctx) < 0) return;
         dev = libusb_open_device_with_vid_pid(ctx, vid, pid);
@@ -205,9 +211,14 @@ int sift_engine_verify(const unsigned char* saved_data, int data_size) {
 
     const int* header = (const int*)saved_data;
     int rows = header[0], cols = header[1], type = header[2];
-    
-    int expected_data_size = rows * cols * CV_ELEM_SIZE(type);
-    if (12 + expected_data_size != data_size) return 0;
+
+    // Sanity bounds: reject corrupted/malicious data before arithmetic
+    if (rows <= 0 || rows > 10000 || cols <= 0 || cols > 256 || type < 0 || type > 30) return 0;
+
+    size_t elem_size = CV_ELEM_SIZE(type);
+    size_t expected_data_size = (size_t)rows * (size_t)cols * elem_size;
+    if (expected_data_size > (size_t)(data_size - 12)) return 0;
+    if (12 + (int)expected_data_size != data_size) return 0;
 
     Mat saved_des(rows, cols, type, (void*)(saved_data + 12));
     Mat saved_des_cloned = saved_des.clone();
