@@ -13,10 +13,18 @@ It completely bypasses the broken default `libfprint` image-matching algorithm. 
 
 ## ⚡ Recent Enhancements & Fixes
 
-* **Non-Blocking Async Architecture (`GThread`):** Moved USB capturing and heavy SIFT processing into dedicated background threads in `elan.c`, eliminating GLib main loop freezes and keeping `fprintd` / lock screen responsive.
-* **RAII LibUSB Lifecycle Management:** Added automatic kernel driver re-attachment (`libusb_attach_kernel_driver`) and safe interface release to prevent USB handle/interface leaks.
-* **Dynamic Noise Baselining:** Replaced static stddev noise thresholds with dynamic background noise sampling, ensuring reliable touch detection across dry/wet skin conditions.
-* **SIFT Descriptor Deduplication & Correct Matching:** Fixed KNN query/train matching order and added feature deduplication during multi-touch enrollment.
+* **2× Image Upscaling:** Upscale 80×80 → 160×160 before SIFT processing, yielding 2-3× more keypoints per frame.
+* **Advanced Preprocessing Pipeline:** CLAHE (clip=3.0) + unsharp mask sharpening for enhanced fingerprint ridge contrast.
+* **Tuned SIFT Parameters:** `nOctaveLayers=5`, `contrastThreshold=0.03`, `sigma=1.2` — optimized for tiny sensor images.
+* **Image Quality Scoring:** Frames scored by keypoint count × spatial coverage; low-quality (partial touch, smudge) frames are rejected.
+* **Multi-Frame Best-of-3 Verification:** Captures up to 3 rapid frames from a single touch, tries matching with the highest quality frame first.
+* **FLANN Matcher:** KD-tree based matcher replaces brute-force — ~5× faster on large super-templates.
+* **Hybrid Match Scoring:** `good_matches ≥ 6 AND match_ratio ≥ 25%` — adapts to varying keypoint counts across skin conditions.
+* **Non-Blocking Async Architecture (`GThread`):** USB capture and SIFT processing in background threads, keeping `fprintd` responsive.
+* **RAII LibUSB Lifecycle:** Automatic kernel driver re-attachment and safe interface release.
+* **Dynamic Noise Baselining:** Adaptive touch thresholds based on sensor noise sampling.
+
+> ⚠️ **Re-enrollment required:** The new preprocessing pipeline produces different SIFT descriptors. Run `fprintd-delete "$USER"` and re-enroll after upgrading.
 
 ---
 
