@@ -13,13 +13,12 @@ It completely bypasses the broken default `libfprint` image-matching algorithm. 
 
 ## ⚡ Recent Enhancements & Fixes
 
-* **2× Image Upscaling:** Upscale 80×80 → 160×160 before SIFT processing, yielding 2-3× more keypoints per frame.
-* **Advanced Preprocessing Pipeline:** CLAHE (clip=3.0) + unsharp mask sharpening for enhanced fingerprint ridge contrast.
-* **Tuned SIFT Parameters:** `nOctaveLayers=5`, `contrastThreshold=0.03`, `sigma=1.2` — optimized for tiny sensor images.
-* **Image Quality Scoring:** Frames scored by keypoint count × spatial coverage; low-quality (partial touch, smudge) frames are rejected.
-* **Multi-Frame Best-of-3 Verification:** Captures up to 3 rapid frames from a single touch, tries matching with the highest quality frame first.
-* **FLANN Matcher:** KD-tree based matcher replaces brute-force — ~5× faster on large super-templates.
-* **Hybrid Match Scoring:** `good_matches ≥ 6 AND match_ratio ≥ 25%` — adapts to varying keypoint counts across skin conditions.
+* **2× Image Upscaling:** Pre-denoised (`GaussianBlur 5×5`) + 2× bicubic upscale (80×80 → 160×160) + CLAHE (`clip=2.5`) for clean ridge contrast without high-frequency noise amplification.
+* **Tuned SIFT Parameters:** `nfeatures=150`, `nOctaveLayers=4`, `contrastThreshold=0.04`, `edgeThreshold=12`, `sigma=1.6` — prevents noise keypoint inflation while extracting stable ridge features.
+* **Image Quality Scoring & Settled Capture:** 40ms finger-settling delay + USB buffer integrity validation + in-loop quality gate during enrollment and verification.
+* **Multi-Frame Best-of-3 Verification:** Captures up to 3 settled frames from a single touch, sorting by quality score descending.
+* **Exact L2 Matcher & Calibrated Deduplication:** Uses exact `BFMatcher(NORM_L2)` with `180.0` L2 super-template deduplication distance so cross-touch duplicate features don't self-cancel during Lowe's ratio test (`0.75`).
+* **Relaxed Hybrid Match Scoring:** `(good_matches ≥ 5 AND match_ratio ≥ 8%) OR good_matches ≥ 8` — handles partial spatial overlap on tiny 80×80 crops.
 * **Non-Blocking Async Architecture (`GThread`):** USB capture and SIFT processing in background threads, keeping `fprintd` responsive.
 * **RAII LibUSB Lifecycle:** Automatic kernel driver re-attachment and safe interface release.
 * **Dynamic Noise Baselining:** Adaptive touch thresholds based on sensor noise sampling.
@@ -61,11 +60,11 @@ If you want to port this method to another unsupported sensor (e.g., Goodix, Egi
 
 **Requirements:** `libusb-1.0-0-dev`, `libopencv-dev`, `meson`, `ninja-build`
 
-1. Clone the official `libfprint` v1.94 repository:
+1. Clone the official `libfprint` repository (use `master` branch to match the provided `meson.build` driver list):
     ```bash
     git clone https://gitlab.freedesktop.org/libfprint/libfprint.git
     cd libfprint
-    git checkout v1.94.1
+    git checkout master
     ```
 
 2. Copy the files from this repo's `native_libfprint_driver` folder into your `libfprint` source code:

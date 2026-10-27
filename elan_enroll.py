@@ -10,29 +10,28 @@ import os
 DIR = '/etc/elan_fingerprint'
 REQUIRED_TOUCHES = 5
 
-# Tuned SIFT for 80x80 fingerprint sensor images (same as C++ and verify.py)
+# Tuned SIFT for upscaled 160x160 fingerprint sensor images (same as C++ and verify.py)
 sift = cv2.SIFT_create(
-    nfeatures=0,
-    nOctaveLayers=5,
-    contrastThreshold=0.03,
-    edgeThreshold=15,
-    sigma=1.2
+    nfeatures=150,
+    nOctaveLayers=4,
+    contrastThreshold=0.04,
+    edgeThreshold=12,
+    sigma=1.6
 )
 
 
 def process_image(img):
-    """Advanced fingerprint preprocessing: upscale + CLAHE + unsharp mask.
+    """Advanced fingerprint preprocessing: denoise + 2x upscale + CLAHE.
     Must be identical to C++ process_image() in sift_engine.cpp.
     """
-    # 1. Upscale 2x — gives SIFT one more octave on 80x80 images
-    upscaled = cv2.resize(img, (img.shape[1] * 2, img.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
-    # 2. CLAHE with higher clip limit for ridge contrast
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    # 1. Gentle Gaussian denoise on raw 80x80 frame to suppress pixel noise
+    denoised = cv2.GaussianBlur(img, (5, 5), 0)
+    # 2. Upscale 2x — gives SIFT one more octave on 80x80 images
+    upscaled = cv2.resize(denoised, (img.shape[1] * 2, img.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
+    # 3. CLAHE for balanced ridge contrast
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     enhanced = clahe.apply(upscaled)
-    # 3. Unsharp mask — sharpen ridge edges
-    blurred = cv2.GaussianBlur(enhanced, (3, 3), 1.0)
-    sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
-    return sharpened
+    return enhanced
 
 
 def compute_quality(img, keypoints):
@@ -87,8 +86,11 @@ def main():
             dev.write(EP_OUT, [0x00, 0x09])
             try:
                 data = dev.read(EP_IN, 12800, timeout=500)
+                if len(data) != 12800:
+                    continue
                 raw_data = np.frombuffer(data, dtype='<u2').reshape((80, 80))
-                baseline_samples.append(np.std(raw_data))
+                if int(raw_data.max()) > int(raw_data.min()) and 1.0 < float(np.mean(raw_data)) < 65000.0:
+                    baseline_samples.append(np.std(raw_data))
             except usb.core.USBError:
                 pass
             time.sleep(0.03)
@@ -106,16 +108,30 @@ def main():
                 dev.write(EP_OUT, [0x40, 0x3f])
                 dev.write(EP_OUT, [0x00, 0x09])
                 data = dev.read(EP_IN, 12800, timeout=1000)
+                if len(data) != 12800:
+                    continue
                 raw_data = np.frombuffer(data, dtype='<u2').reshape((80, 80))
+                if int(raw_data.max()) <= int(raw_data.min()) or not (1.0 < float(np.mean(raw_data)) < 65000.0):
+                    continue
                 stddev = np.std(raw_data)
 
                 if waiting_for_off:
                     if stddev < touch_off_threshold:
                         waiting_for_off = False
                         print("Палец убран. Приложите еще раз...")
-                        time.sleep(0.2)
+                        time.sleep(0.15)
                 else:
                     if stddev > touch_on_threshold:
+                        # Settling delay so finger is flat on sensor before capture
+                        time.sleep(0.04)
+                        dev.write(EP_OUT, [0x40, 0x3f])
+                        dev.write(EP_OUT, [0x00, 0x09])
+                        settled_data = dev.read(EP_IN, 12800, timeout=1000)
+                        if len(settled_data) == 12800:
+                            settled_raw = np.frombuffer(settled_data, dtype='<u2').reshape((80, 80))
+                            if int(settled_raw.max()) > int(settled_raw.min()) and np.std(settled_raw) > touch_on_threshold:
+                                raw_data = settled_raw
+
                         img_8bit = cv2.normalize(raw_data, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
 
                         # Quality gate: check if frame has enough features
@@ -124,7 +140,7 @@ def main():
 
                         if des is not None and len(kp) >= 8:
                             quality = compute_quality(processed, kp)
-                            if quality >= 3.0:
+                            if quality >= 2.5:
                                 # Save raw 8-bit image (processing applied during verification)
                                 existing_files = [f for f in os.listdir(DIR) if f.startswith('template_') and f.endswith('.png')]
                                 max_idx = 0

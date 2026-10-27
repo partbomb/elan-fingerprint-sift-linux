@@ -18,36 +18,32 @@ except Exception as e:
 
 DIR = '/etc/elan_fingerprint'
 
-# Tuned SIFT for 80x80 fingerprint sensor images
+# Tuned SIFT for upscaled 160x160 fingerprint sensor images (parity with C++ & enroll.py)
 sift = cv2.SIFT_create(
-    nfeatures=0,             # unlimited
-    nOctaveLayers=5,         # more scale levels for tiny images
-    contrastThreshold=0.03,  # lower = more sensitive to subtle ridges
-    edgeThreshold=15,        # reject sensor boundary artifacts
-    sigma=1.2                # slightly lower for sharper features
+    nfeatures=150,           # cap to top 150 strongest keypoints to prevent ratio dilution
+    nOctaveLayers=4,         # scale levels suited for 160x160 ridge patterns
+    contrastThreshold=0.04,  # reject low-contrast background/sensor noise
+    edgeThreshold=12,        # reject sensor boundary artifacts
+    sigma=1.6                # standard SIFT base blur for stable gradient orientations
 )
 
 templates = []
-
-# FLANN matcher parameters for SIFT (float32) descriptors
-FLANN_INDEX_KDTREE = 1
-flann_index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-flann_search_params = dict(checks=50)
+super_des = None
+bf_matcher = cv2.BFMatcher(cv2.NORM_L2)
 
 
 def process_image(img):
-    """Advanced fingerprint preprocessing: upscale + CLAHE + unsharp mask.
+    """Advanced fingerprint preprocessing: denoise + 2x upscale + CLAHE.
     Must be identical to C++ process_image() in sift_engine.cpp.
     """
-    # 1. Upscale 2x — gives SIFT one more octave on 80x80 images
-    upscaled = cv2.resize(img, (img.shape[1] * 2, img.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
-    # 2. CLAHE with higher clip limit for ridge contrast
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    # 1. Gentle Gaussian denoise on raw 80x80 frame to suppress pixel noise
+    denoised = cv2.GaussianBlur(img, (5, 5), 0)
+    # 2. Upscale 2x — gives SIFT one more octave on 80x80 images
+    upscaled = cv2.resize(denoised, (img.shape[1] * 2, img.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
+    # 3. CLAHE for balanced ridge contrast
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     enhanced = clahe.apply(upscaled)
-    # 3. Unsharp mask — sharpen ridge edges
-    blurred = cv2.GaussianBlur(enhanced, (3, 3), 1.0)
-    sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
-    return sharpened
+    return enhanced
 
 
 def compute_quality(img, keypoints):
@@ -64,7 +60,20 @@ def compute_quality(img, keypoints):
     return len(keypoints) * max(coverage, 0.1)
 
 
-# 1. Load all enrollment templates into memory
+def is_valid_raw_frame(raw_data):
+    """Reject empty, constant, or rail-saturated USB frames."""
+    if raw_data is None or raw_data.size != 6400:
+        return False
+    min_val, max_val = int(raw_data.min()), int(raw_data.max())
+    if max_val <= min_val:
+        return False
+    mean_val = float(np.mean(raw_data))
+    if mean_val < 1.0 or mean_val > 65000.0:
+        return False
+    return True
+
+
+# 1. Load all enrollment templates into memory and build deduplicated super-template
 try:
     if os.path.exists(DIR):
         for filename in sorted(os.listdir(DIR)):
@@ -75,50 +84,67 @@ try:
             if img is not None:
                 clean = process_image(img)
                 kp, des = sift.detectAndCompute(clean, None)
-                if des is not None and len(kp) >= 5:
+                if des is not None and len(kp) >= 6:
                     templates.append((kp, des, filename))
+                    if super_des is None:
+                        super_des = des.copy()
+                    else:
+                        unique_rows = []
+                        for i in range(len(des)):
+                            single_des = des[i:i+1]
+                            m = bf_matcher.match(single_des, super_des)
+                            if not m or m[0].distance > 180.0:
+                                unique_rows.append(single_des)
+                        if unique_rows:
+                            super_des = np.vstack([super_des] + unique_rows)
                     logging.debug(f"Загружен эталон {filename}: {len(kp)} keypoints")
 except Exception as e:
     logging.error(f"Ошибка загрузки эталонов: {e}")
 
 
 def verify(captured_img):
-    """Verify a captured frame against all enrolled templates.
-    Uses FLANN matcher with hybrid scoring (absolute count + ratio).
+    """Verify a captured frame against the super-template and individual templates.
+    Uses exact L2 BFMatcher with relaxed hybrid scoring for 80x80 upscaled crops.
     """
     captured_clean = process_image(captured_img)
     kp2, des2 = sift.detectAndCompute(captured_clean, None)
 
-    if des2 is None or len(kp2) < 8:
+    if des2 is None or len(kp2) < 6:
         logging.debug(f"Frame rejected: only {len(kp2) if kp2 else 0} keypoints")
         return False
 
-    # Quality gate: reject low-quality frames before expensive matching
     quality = compute_quality(captured_clean, kp2)
-    if quality < 3.0:
+    if quality < 2.0:
         logging.debug(f"Frame rejected: low quality {quality:.2f}")
         return False
 
-    flann = cv2.FlannBasedMatcher(flann_index_params, flann_search_params)
+    # First check against combined deduplicated super-template (parity with C++ driver)
+    if super_des is not None and len(super_des) >= 2:
+        matches = bf_matcher.knnMatch(des2, super_des, k=2)
+        good_matches = [
+            m[0] for m in matches
+            if len(m) == 2 and m[0].distance < 0.75 * m[1].distance
+        ]
+        match_ratio = len(good_matches) / len(kp2)
+        logging.info(f"Сверка с super_template: {len(good_matches)} точек, ratio={match_ratio:.2f}, quality={quality:.1f}")
+        if (len(good_matches) >= 5 and match_ratio >= 0.08) or len(good_matches) >= 8:
+            return True
 
+    # Fallback: check individual enrollment templates
     for kp1, des1, filename in templates:
         if des1 is None or len(des1) < 2:
             continue
 
-        matches = flann.knnMatch(des2, des1, k=2)
+        matches = bf_matcher.knnMatch(des2, des1, k=2)
+        good_matches = [
+            m[0] for m in matches
+            if len(m) == 2 and m[0].distance < 0.75 * m[1].distance
+        ]
 
-        good_matches = []
-        for match_pair in matches:
-            if len(match_pair) == 2:
-                m, n = match_pair
-                if m.distance < 0.7 * n.distance:
-                    good_matches.append(m)
-
-        # Hybrid scoring: absolute count AND match ratio
         match_ratio = len(good_matches) / len(kp2) if len(kp2) > 0 else 0.0
         logging.info(f"Сверка с {filename}: {len(good_matches)} точек, ratio={match_ratio:.2f}, quality={quality:.1f}")
 
-        if len(good_matches) >= 6 and match_ratio >= 0.25:
+        if (len(good_matches) >= 5 and match_ratio >= 0.08) or len(good_matches) >= 8:
             return True
 
     return False
@@ -157,8 +183,11 @@ def main():
             dev.write(EP_OUT, [0x00, 0x09])
             try:
                 data = dev.read(EP_IN, 12800, timeout=500)
+                if len(data) != 12800:
+                    continue
                 raw_data = np.frombuffer(data, dtype='<u2').reshape((80, 80))
-                baseline_samples.append(np.std(raw_data))
+                if is_valid_raw_frame(raw_data):
+                    baseline_samples.append(np.std(raw_data))
             except usb.core.USBError:
                 pass
             time.sleep(0.03)
@@ -167,6 +196,7 @@ def main():
         touch_on_threshold = max(250.0, baseline_std * 2.2)
 
         start_time = time.time()
+        touch_settled = False
 
         while time.time() - start_time < 5.0:
             try:
@@ -174,17 +204,27 @@ def main():
                 dev.write(EP_OUT, [0x00, 0x09])
 
                 data = dev.read(EP_IN, 12800, timeout=1000)
+                if len(data) != 12800:
+                    continue
                 raw_data = np.frombuffer(data, dtype='<u2').reshape((80, 80))
+                if not is_valid_raw_frame(raw_data):
+                    continue
 
                 if np.std(raw_data) > touch_on_threshold:
+                    if not touch_settled:
+                        touch_settled = True
+                        time.sleep(0.04)
+                        continue
                     captured_img = cv2.normalize(raw_data, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
                     if verify(captured_img):
                         logging.info("Авторизация успешна!")
                         sys.exit(0)
+                else:
+                    touch_settled = False
             except usb.core.USBError:
                 pass
 
-            time.sleep(0.05)
+            time.sleep(0.04)
 
         logging.warning("Ошибка авторизации: совпадений не найдено или таймаут")
         sys.exit(1)

@@ -137,7 +137,7 @@ static void fpi_device_elan_class_init(FpiDeviceElanClass *klass) {
     dev_class->id_table = elan_id_table;
     dev_class->scan_type = FP_SCAN_TYPE_PRESS;
     dev_class->nr_enroll_stages = 1;
-    dev_class->features = FP_DEVICE_FEATURE_VERIFY | FP_DEVICE_FEATURE_ENROLL;
+    dev_class->features = FP_DEVICE_FEATURE_VERIFY;
     
     dev_class->open = elan_open;
     dev_class->close = elan_close;
