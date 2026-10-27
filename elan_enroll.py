@@ -77,11 +77,11 @@ def main():
         print(f"Необходимо приложить палец {REQUIRED_TOUCHES} раз для завершения регистрации.")
 
         dev.write(EP_OUT, [0x40, 0x31])
-        time.sleep(0.3)
+        time.sleep(0.05)
 
-        # Baseline noise estimation
+        # Baseline noise estimation (ignore frames if finger is already on sensor)
         baseline_samples = []
-        for _ in range(5):
+        for _ in range(2):
             dev.write(EP_OUT, [0x40, 0x3f])
             dev.write(EP_OUT, [0x00, 0x09])
             try:
@@ -90,10 +90,12 @@ def main():
                     continue
                 raw_data = np.frombuffer(data, dtype='<u2').reshape((80, 80))
                 if int(raw_data.max()) > int(raw_data.min()) and 1.0 < float(np.mean(raw_data)) < 65000.0:
-                    baseline_samples.append(np.std(raw_data))
+                    std_val = np.std(raw_data)
+                    if std_val < 220.0:
+                        baseline_samples.append(std_val)
             except usb.core.USBError:
                 pass
-            time.sleep(0.03)
+            time.sleep(0.01)
 
         baseline_std = np.mean(baseline_samples) if baseline_samples else 100.0
         touch_on_threshold = max(250.0, baseline_std * 2.2)

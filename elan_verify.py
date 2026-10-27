@@ -174,11 +174,11 @@ def main():
 
         # Инициализация сенсора
         dev.write(EP_OUT, [0x40, 0x31])
-        time.sleep(0.3)
+        time.sleep(0.05)
 
-        # Динамический замер уровня шума
+        # Быстрый замер уровня шума (игнорируем кадры, если палец уже лежит на сенсоре)
         baseline_samples = []
-        for _ in range(5):
+        for _ in range(2):
             dev.write(EP_OUT, [0x40, 0x3f])
             dev.write(EP_OUT, [0x00, 0x09])
             try:
@@ -187,10 +187,12 @@ def main():
                     continue
                 raw_data = np.frombuffer(data, dtype='<u2').reshape((80, 80))
                 if is_valid_raw_frame(raw_data):
-                    baseline_samples.append(np.std(raw_data))
+                    std_val = np.std(raw_data)
+                    if std_val < 220.0:
+                        baseline_samples.append(std_val)
             except usb.core.USBError:
                 pass
-            time.sleep(0.03)
+            time.sleep(0.01)
 
         baseline_std = np.mean(baseline_samples) if baseline_samples else 100.0
         touch_on_threshold = max(250.0, baseline_std * 2.2)
@@ -213,7 +215,7 @@ def main():
                 if np.std(raw_data) > touch_on_threshold:
                     if not touch_settled:
                         touch_settled = True
-                        time.sleep(0.04)
+                        time.sleep(0.025)
                         continue
                     captured_img = cv2.normalize(raw_data, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
                     if verify(captured_img):
@@ -224,7 +226,7 @@ def main():
             except usb.core.USBError:
                 pass
 
-            time.sleep(0.04)
+            time.sleep(0.025)
 
         logging.warning("Ошибка авторизации: совпадений не найдено или таймаут")
         sys.exit(1)

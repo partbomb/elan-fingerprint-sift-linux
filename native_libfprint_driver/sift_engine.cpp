@@ -148,22 +148,24 @@ static bool read_sensor_frame(libusb_device_handle *dev, unsigned char *buffer, 
     return (res == 0 && transferred == 12800);
 }
 
-// Estimate baseline noise from idle sensor
+// Estimate baseline noise from idle sensor (fast 2-sample probe).
+// Ignores samples with stddev >= 220 so that a finger already resting on the
+// sensor at startup never inflates touch_threshold.
 static double estimate_baseline(libusb_device_handle *dev,
                                 unsigned char *buffer, int buf_len) {
     double baseline_stddev = 0.0;
     int baseline_samples = 0;
 
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 2; ++i) {
         if (read_sensor_frame(dev, buffer, buf_len)) {
             Mat raw(80, 80, CV_16UC1, buffer);
             double stddev = 0.0;
-            if (is_valid_raw_frame(raw, stddev)) {
+            if (is_valid_raw_frame(raw, stddev) && stddev < 220.0) {
                 baseline_stddev += stddev;
                 baseline_samples++;
             }
         }
-        this_thread::sleep_for(chrono::milliseconds(30));
+        this_thread::sleep_for(chrono::milliseconds(10));
     }
 
     return (baseline_samples > 0) ? baseline_stddev / baseline_samples : 100.0;
@@ -177,7 +179,7 @@ static bool capture_usb_images(vector<Mat>& out_images, int required_touches, in
     int transferred = 0;
     unsigned char wake_cmd[] = {0x40, 0x31};
     libusb_bulk_transfer(usb.dev, 0x01, wake_cmd, sizeof(wake_cmd), &transferred, 1000);
-    this_thread::sleep_for(chrono::milliseconds(300));
+    this_thread::sleep_for(chrono::milliseconds(50));
 
     unsigned char buffer[12800];
     double baseline = estimate_baseline(usb.dev, buffer, sizeof(buffer));
@@ -187,6 +189,7 @@ static bool capture_usb_images(vector<Mat>& out_images, int required_touches, in
     Ptr<SIFT> sift = create_tuned_sift();
     int touches = 0;
     bool waiting_for_off = false;
+    bool touch_settling = false;
     auto start_time = chrono::steady_clock::now();
 
     while (touches < required_touches &&
@@ -199,17 +202,14 @@ static bool capture_usb_images(vector<Mat>& out_images, int required_touches, in
                 if (waiting_for_off) {
                     if (stddev < touch_off_threshold) {
                         waiting_for_off = false;
-                        this_thread::sleep_for(chrono::milliseconds(150));
+                        touch_settling = false;
+                        this_thread::sleep_for(chrono::milliseconds(80));
                     }
                 } else if (stddev > touch_on_threshold) {
-                    // Brief settling delay so finger is flat on sensor before capture
-                    this_thread::sleep_for(chrono::milliseconds(40));
-                    if (read_sensor_frame(usb.dev, buffer, sizeof(buffer))) {
-                        Mat settled_raw(80, 80, CV_16UC1, buffer);
-                        double settled_std = 0.0;
-                        if (is_valid_raw_frame(settled_raw, settled_std) && settled_std > touch_on_threshold) {
-                            raw = settled_raw;
-                        }
+                    if (!touch_settling) {
+                        touch_settling = true;
+                        this_thread::sleep_for(chrono::milliseconds(25));
+                        continue;
                     }
 
                     Mat norm_img;
@@ -225,61 +225,43 @@ static bool capture_usb_images(vector<Mat>& out_images, int required_touches, in
                         out_images.push_back(norm_img.clone());
                         touches++;
                         waiting_for_off = true;
+                        touch_settling = false;
                     }
+                } else {
+                    touch_settling = false;
                 }
             }
         }
-        this_thread::sleep_for(chrono::milliseconds(50));
+        this_thread::sleep_for(chrono::milliseconds(25));
     }
 
     return touches > 0;
 }
 
-// Capture multiple settled frames from a single touch (for verification — best-of-3)
-static bool capture_verify_frames(vector<Mat>& out_images, int max_frames, int timeout_sec) {
-    ScopedUsbDevice usb(0x04f3, 0x0c4f);
-    if (!usb.is_valid()) return false;
+// Check if a single 8-bit sensor frame matches the enrolled super-template
+static bool match_single_frame(const Mat& norm_img, const Mat& saved_des, Ptr<SIFT>& sift, BFMatcher& matcher) {
+    Mat clean_img = process_image(norm_img);
+    vector<KeyPoint> keypoints;
+    Mat descriptors;
+    sift->detectAndCompute(clean_img, noArray(), keypoints, descriptors);
 
-    int transferred = 0;
-    unsigned char wake_cmd[] = {0x40, 0x31};
-    libusb_bulk_transfer(usb.dev, 0x01, wake_cmd, sizeof(wake_cmd), &transferred, 1000);
-    this_thread::sleep_for(chrono::milliseconds(300));
+    if (descriptors.empty() || keypoints.size() < 6) return false;
+    if (compute_quality(clean_img, keypoints) < 2.0) return false;
 
-    unsigned char buffer[12800];
-    double baseline = estimate_baseline(usb.dev, buffer, sizeof(buffer));
-    double touch_threshold = max(250.0, baseline * 2.2);
+    vector<vector<DMatch>> knn_matches;
+    matcher.knnMatch(descriptors, saved_des, knn_matches, 2);
 
-    auto start_time = chrono::steady_clock::now();
-    bool touch_detected = false;
-
-    while (chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - start_time).count() < timeout_sec) {
-        if (read_sensor_frame(usb.dev, buffer, sizeof(buffer))) {
-            Mat raw(80, 80, CV_16UC1, buffer);
-            double stddev = 0.0;
-
-            if (is_valid_raw_frame(raw, stddev) && stddev > touch_threshold) {
-                if (!touch_detected) {
-                    touch_detected = true;
-                    // Allow 40ms for initial finger contact to flatten before grabbing best-of-3
-                    this_thread::sleep_for(chrono::milliseconds(40));
-                    continue;
-                }
-
-                Mat norm_img;
-                normalize(raw, norm_img, 0, 255, NORM_MINMAX, CV_8UC1);
-                out_images.push_back(norm_img.clone());
-
-                if ((int)out_images.size() >= max_frames) break;
-                this_thread::sleep_for(chrono::milliseconds(40));
-                continue;
-            } else if (touch_detected && !out_images.empty()) {
-                break; // Finger lifted after capturing at least one settled frame
+    int good_matches = 0;
+    for (size_t i = 0; i < knn_matches.size(); i++) {
+        if (knn_matches[i].size() >= 2) {
+            if (knn_matches[i][0].distance < 0.75f * knn_matches[i][1].distance) {
+                good_matches++;
             }
         }
-        this_thread::sleep_for(chrono::milliseconds(40));
     }
 
-    return !out_images.empty();
+    double match_ratio = (double)good_matches / (double)keypoints.size();
+    return (good_matches >= 5 && match_ratio >= 0.08) || good_matches >= 8;
 }
 
 // ===================== SIFT ENGINE API =====================
@@ -368,61 +350,56 @@ int sift_engine_verify(const unsigned char* saved_data, int data_size) {
     Mat saved_des(rows, cols, type, (void*)(saved_data + 12));
     Mat saved_des_cloned = saved_des.clone();
 
-    // Capture up to 3 settled frames from a single touch
-    vector<Mat> images;
-    if (!capture_verify_frames(images, 3, 10)) return 0;
+    ScopedUsbDevice usb(0x04f3, 0x0c4f);
+    if (!usb.is_valid()) return 0;
+
+    int transferred = 0;
+    unsigned char wake_cmd[] = {0x40, 0x31};
+    libusb_bulk_transfer(usb.dev, 0x01, wake_cmd, sizeof(wake_cmd), &transferred, 1000);
+    this_thread::sleep_for(chrono::milliseconds(50));
+
+    unsigned char buffer[12800];
+    double baseline = estimate_baseline(usb.dev, buffer, sizeof(buffer));
+    double touch_threshold = max(250.0, baseline * 2.2);
 
     Ptr<SIFT> sift = create_tuned_sift();
-
-    // Process all captured frames and assess quality
-    struct FrameResult {
-        vector<KeyPoint> keypoints;
-        Mat descriptors;
-        double quality;
-    };
-
-    vector<FrameResult> results;
-    for (const auto& img : images) {
-        FrameResult fr;
-        Mat clean_img = process_image(img);
-        sift->detectAndCompute(clean_img, noArray(), fr.keypoints, fr.descriptors);
-
-        if (fr.descriptors.empty() || fr.keypoints.size() < 6) continue;
-
-        fr.quality = compute_quality(clean_img, fr.keypoints);
-        if (fr.quality < 2.0) continue;
-        results.push_back(fr);
-    }
-
-    if (results.empty()) return 0;
-
-    // Sort by quality descending — try best frame first
-    sort(results.begin(), results.end(), [](const FrameResult& a, const FrameResult& b) {
-        return a.quality > b.quality;
-    });
-
-    // Exact L2 BFMatcher guarantees true nearest neighbors in 128-D SIFT space
-    // (takes <0.2ms for ~500 descriptors and avoids KD-tree approximation misses)
     BFMatcher matcher(NORM_L2);
 
-    for (const auto& fr : results) {
-        vector<vector<DMatch>> knn_matches;
-        matcher.knnMatch(fr.descriptors, saved_des_cloned, knn_matches, 2);
+    auto start_time = chrono::steady_clock::now();
+    bool touch_detected = false;
+    int frames_checked = 0;
 
-        int good_matches = 0;
-        for (size_t i = 0; i < knn_matches.size(); i++) {
-            if (knn_matches[i].size() >= 2) {
-                if (knn_matches[i][0].distance < 0.75f * knn_matches[i][1].distance) {
-                    good_matches++;
+    // Instant streaming verification: matches on the very first settled frame (~0.1-0.2s)
+    // and continues checking rapid frames while the finger stays on the sensor.
+    while (chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - start_time).count() < 10) {
+        if (read_sensor_frame(usb.dev, buffer, sizeof(buffer))) {
+            Mat raw(80, 80, CV_16UC1, buffer);
+            double stddev = 0.0;
+
+            if (is_valid_raw_frame(raw, stddev) && stddev > touch_threshold) {
+                if (!touch_detected) {
+                    touch_detected = true;
+                    // Brief 25ms settle so initial finger contact flattens
+                    this_thread::sleep_for(chrono::milliseconds(25));
+                    continue;
                 }
+
+                Mat norm_img;
+                normalize(raw, norm_img, 0, 255, NORM_MINMAX, CV_8UC1);
+                frames_checked++;
+
+                if (match_single_frame(norm_img, saved_des_cloned, sift, matcher)) {
+                    return 1; // Instant unlock on first matching frame!
+                }
+
+                if (frames_checked >= 5) break;
+                this_thread::sleep_for(chrono::milliseconds(25));
+                continue;
+            } else if (touch_detected && frames_checked > 0) {
+                break; // Finger lifted after attempt
             }
         }
-
-        // Relaxed hybrid scoring for 80x80 upscaled crops with partial touch overlap
-        double match_ratio = (double)good_matches / (double)fr.keypoints.size();
-        if ((good_matches >= 5 && match_ratio >= 0.08) || good_matches >= 8) {
-            return 1;
-        }
+        this_thread::sleep_for(chrono::milliseconds(25));
     }
 
     return 0;
