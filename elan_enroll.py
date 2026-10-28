@@ -14,7 +14,7 @@ REQUIRED_TOUCHES = 5
 sift = cv2.SIFT_create(
     nfeatures=150,
     nOctaveLayers=4,
-    contrastThreshold=0.04,
+    contrastThreshold=0.035,
     edgeThreshold=12,
     sigma=1.6
 )
@@ -24,12 +24,12 @@ def process_image(img):
     """Advanced fingerprint preprocessing: denoise + 2x upscale + CLAHE.
     Must be identical to C++ process_image() in sift_engine.cpp.
     """
-    # 1. Gentle Gaussian denoise on raw 80x80 frame to suppress pixel noise
-    denoised = cv2.GaussianBlur(img, (5, 5), 0)
+    # 1. Light 3x3 Gaussian denoise preserves diagonal ridges under 20-40 deg rotation
+    denoised = cv2.GaussianBlur(img, (3, 3), 0.8)
     # 2. Upscale 2x — gives SIFT one more octave on 80x80 images
     upscaled = cv2.resize(denoised, (img.shape[1] * 2, img.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
-    # 3. CLAHE for balanced ridge contrast
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    # 3. CLAHE with 4x4 tile grid (40x40px tiles) for rotation-stable ridge contrast
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
     enhanced = clahe.apply(upscaled)
     return enhanced
 

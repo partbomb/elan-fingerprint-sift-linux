@@ -11,8 +11,9 @@ ldconfig
 
 echo "=== 2. Включение разблокировки по отпечатку для экрана блокировки KDE, входа и sudo ==="
 pam-auth-update --enable fprintd
+sed -i 's/max-tries=1/max-tries=3/g' /etc/pam.d/common-auth || true
 
-echo "=== 3. Очистка старого swipe-отпечатка и перезапуск fprintd ==="
+echo "=== 3. Очистка старого отпечатка и перезапуск fprintd ==="
 systemctl stop fprintd || true
 rm -rf /var/lib/fprint/"$TARGET_USER"
 systemctl start fprintd
@@ -21,9 +22,10 @@ echo "=== 4. Проверка драйвера (должно быть 'Elan Troj
 fprintd-list "$TARGET_USER"
 
 echo ""
-echo "Теперь зарегистрируйте палец (просто ПРИКЛАДЫВАЙТЕ на 0.3с 5 раз, НЕ нужно проводить!):"
-su - "$TARGET_USER" -c "fprintd-enroll -f right-index-finger"
+echo "Теперь зарегистрируйте палец — 8 коротких касаний (после каждого появится 'enroll-stage-passed')."
+echo "Совет: прикладывайте палец прямо, чуть левее/правее и под небольшим наклоном (20-30°):"
+fprintd-enroll -f right-index-finger "$TARGET_USER"
 
 echo ""
 echo "=== Проверка разблокировки (просто коснитесь сканера на 0.2-0.5с) ==="
-su - "$TARGET_USER" -c "fprintd-verify"
+fprintd-verify "$TARGET_USER"

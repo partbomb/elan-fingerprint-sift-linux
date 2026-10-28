@@ -22,7 +22,7 @@ DIR = '/etc/elan_fingerprint'
 sift = cv2.SIFT_create(
     nfeatures=150,           # cap to top 150 strongest keypoints to prevent ratio dilution
     nOctaveLayers=4,         # scale levels suited for 160x160 ridge patterns
-    contrastThreshold=0.04,  # reject low-contrast background/sensor noise
+    contrastThreshold=0.035, # sensitive to diagonal/rotated ridges while rejecting noise
     edgeThreshold=12,        # reject sensor boundary artifacts
     sigma=1.6                # standard SIFT base blur for stable gradient orientations
 )
@@ -36,14 +36,23 @@ def process_image(img):
     """Advanced fingerprint preprocessing: denoise + 2x upscale + CLAHE.
     Must be identical to C++ process_image() in sift_engine.cpp.
     """
-    # 1. Gentle Gaussian denoise on raw 80x80 frame to suppress pixel noise
-    denoised = cv2.GaussianBlur(img, (5, 5), 0)
+    # 1. Light 3x3 Gaussian denoise preserves diagonal ridges under 20-40 deg rotation
+    denoised = cv2.GaussianBlur(img, (3, 3), 0.8)
     # 2. Upscale 2x — gives SIFT one more octave on 80x80 images
     upscaled = cv2.resize(denoised, (img.shape[1] * 2, img.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
-    # 3. CLAHE for balanced ridge contrast
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    # 3. CLAHE with 4x4 tile grid (40x40px tiles) for rotation-stable ridge contrast
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
     enhanced = clahe.apply(upscaled)
     return enhanced
+
+
+def rotate_sensor_frame(img, angle_deg):
+    """Rotate an 80x80 sensor frame around its center to align rotated finger touches."""
+    if abs(angle_deg) < 0.1:
+        return img
+    h, w = img.shape[:2]
+    rot_mat = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle_deg, 1.0)
+    return cv2.warpAffine(img, rot_mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
 
 def compute_quality(img, keypoints):
@@ -93,7 +102,7 @@ try:
                         for i in range(len(des)):
                             single_des = des[i:i+1]
                             m = bf_matcher.match(single_des, super_des)
-                            if not m or m[0].distance > 180.0:
+                            if not m or m[0].distance > 200.0:
                                 unique_rows.append(single_des)
                         if unique_rows:
                             super_des = np.vstack([super_des] + unique_rows)
@@ -103,49 +112,47 @@ except Exception as e:
 
 
 def verify(captured_img):
-    """Verify a captured frame against the super-template and individual templates.
-    Uses exact L2 BFMatcher with relaxed hybrid scoring for 80x80 upscaled crops.
+    """Verify a captured frame against the super-template across multiple rotation angles.
+    Uses exact L2 BFMatcher with multi-angle alignment (-55 to +55 deg).
     """
-    captured_clean = process_image(captured_img)
-    kp2, des2 = sift.detectAndCompute(captured_clean, None)
+    for angle in (0.0, -20.0, 20.0, -38.0, 38.0, -55.0, 55.0):
+        rotated = rotate_sensor_frame(captured_img, angle)
+        captured_clean = process_image(rotated)
+        kp2, des2 = sift.detectAndCompute(captured_clean, None)
 
-    if des2 is None or len(kp2) < 6:
-        logging.debug(f"Frame rejected: only {len(kp2) if kp2 else 0} keypoints")
-        return False
-
-    quality = compute_quality(captured_clean, kp2)
-    if quality < 2.0:
-        logging.debug(f"Frame rejected: low quality {quality:.2f}")
-        return False
-
-    # First check against combined deduplicated super-template (parity with C++ driver)
-    if super_des is not None and len(super_des) >= 2:
-        matches = bf_matcher.knnMatch(des2, super_des, k=2)
-        good_matches = [
-            m[0] for m in matches
-            if len(m) == 2 and m[0].distance < 0.75 * m[1].distance
-        ]
-        match_ratio = len(good_matches) / len(kp2)
-        logging.info(f"Сверка с super_template: {len(good_matches)} точек, ratio={match_ratio:.2f}, quality={quality:.1f}")
-        if (len(good_matches) >= 5 and match_ratio >= 0.08) or len(good_matches) >= 8:
-            return True
-
-    # Fallback: check individual enrollment templates
-    for kp1, des1, filename in templates:
-        if des1 is None or len(des1) < 2:
+        if des2 is None or len(kp2) < 6:
             continue
 
-        matches = bf_matcher.knnMatch(des2, des1, k=2)
-        good_matches = [
-            m[0] for m in matches
-            if len(m) == 2 and m[0].distance < 0.75 * m[1].distance
-        ]
+        quality = compute_quality(captured_clean, kp2)
+        if quality < 1.8:
+            continue
 
-        match_ratio = len(good_matches) / len(kp2) if len(kp2) > 0 else 0.0
-        logging.info(f"Сверка с {filename}: {len(good_matches)} точек, ratio={match_ratio:.2f}, quality={quality:.1f}")
+        # Check against combined deduplicated super-template (parity with C++ driver)
+        if super_des is not None and len(super_des) >= 2:
+            matches = bf_matcher.knnMatch(des2, super_des, k=2)
+            good_matches = [
+                m[0] for m in matches
+                if len(m) == 2 and m[0].distance < 0.77 * m[1].distance
+            ]
+            match_ratio = len(good_matches) / len(kp2)
+            logging.info(f"Сверка (угол {angle:.0f}°): {len(good_matches)} точек, ratio={match_ratio:.2f}, quality={quality:.1f}")
+            if (len(good_matches) >= 5 and match_ratio >= 0.06) or len(good_matches) >= 7:
+                return True
 
-        if (len(good_matches) >= 5 and match_ratio >= 0.08) or len(good_matches) >= 8:
-            return True
+        # Fallback: check individual enrollment templates
+        for kp1, des1, filename in templates:
+            if des1 is None or len(des1) < 2:
+                continue
+
+            matches = bf_matcher.knnMatch(des2, des1, k=2)
+            good_matches = [
+                m[0] for m in matches
+                if len(m) == 2 and m[0].distance < 0.77 * m[1].distance
+            ]
+
+            match_ratio = len(good_matches) / len(kp2) if len(kp2) > 0 else 0.0
+            if (len(good_matches) >= 5 and match_ratio >= 0.06) or len(good_matches) >= 7:
+                return True
 
     return False
 

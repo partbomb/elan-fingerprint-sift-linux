@@ -30,6 +30,26 @@ typedef struct {
     int size;
 } EnrollTaskData;
 
+typedef struct {
+    FpDevice *device;
+    int stage;
+} EnrollProgressData;
+
+static gboolean elan_enroll_progress_idle(gpointer user_data) {
+    EnrollProgressData *prog = (EnrollProgressData *)user_data;
+    fpi_device_enroll_progress(prog->device, prog->stage, NULL, NULL);
+    g_free(prog);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_sift_enroll_progress(int completed_stages, void *user_data) {
+    EnrollTaskData *task = (EnrollTaskData *)user_data;
+    EnrollProgressData *prog = g_new0(EnrollProgressData, 1);
+    prog->device = task->device;
+    prog->stage = completed_stages;
+    g_idle_add(elan_enroll_progress_idle, prog);
+}
+
 static gboolean elan_enroll_complete_idle(gpointer user_data) {
     EnrollTaskData *task = (EnrollTaskData *)user_data;
     FpPrint *print = NULL;
@@ -50,7 +70,7 @@ static gboolean elan_enroll_complete_idle(gpointer user_data) {
 
 static gpointer elan_enroll_worker_thread(gpointer user_data) {
     EnrollTaskData *task = (EnrollTaskData *)user_data;
-    task->size = sift_engine_enroll(&task->data);
+    task->size = sift_engine_enroll(&task->data, on_sift_enroll_progress, task);
     g_idle_add(elan_enroll_complete_idle, task);
     return NULL;
 }
@@ -136,7 +156,7 @@ static void fpi_device_elan_class_init(FpiDeviceElanClass *klass) {
     dev_class->type = FP_DEVICE_TYPE_USB;
     dev_class->id_table = elan_id_table;
     dev_class->scan_type = FP_SCAN_TYPE_PRESS;
-    dev_class->nr_enroll_stages = 1;
+    dev_class->nr_enroll_stages = 8;
     dev_class->features = FP_DEVICE_FEATURE_VERIFY;
     
     dev_class->open = elan_open;

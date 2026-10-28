@@ -69,20 +69,30 @@ public:
 // Pre-denoising prevents bicubic upscaling and CLAHE from amplifying sensor
 // pixel noise, while 2x upscaling (80x80 -> 160x160) gives SIFT an extra octave.
 static Mat process_image(const Mat& img) {
-    // 1. Gentle Gaussian denoise on raw 80x80 frame to suppress pixel noise
+    // 1. Light 3x3 Gaussian denoise (sigma=0.8) preserves diagonal ridges under 20-40 deg rotation
     Mat denoised;
-    GaussianBlur(img, denoised, Size(5, 5), 0);
+    GaussianBlur(img, denoised, Size(3, 3), 0.8);
 
-    // 2. Upscale 2x with bicubic interpolation
+    // 2. Upscale 2x with bicubic interpolation (80x80 -> 160x160)
     Mat upscaled;
     resize(denoised, upscaled, Size(img.cols * 2, img.rows * 2), 0, 0, INTER_CUBIC);
 
-    // 3. CLAHE for balanced fingerprint ridge contrast without noise clipping
-    Ptr<CLAHE> clahe = createCLAHE(2.5, Size(8, 8));
+    // 3. CLAHE with 4x4 tile grid (40x40px tiles) for rotation-stable ridge contrast
+    Ptr<CLAHE> clahe = createCLAHE(2.5, Size(4, 4));
     Mat enhanced;
     clahe->apply(upscaled, enhanced);
 
     return enhanced;
+}
+
+// Rotate an 80x80 sensor frame around its center to align rotated finger touches
+static Mat rotate_sensor_frame(const Mat& img, double angle_deg) {
+    if (std::abs(angle_deg) < 0.1) return img;
+    Point2f center(img.cols / 2.0f, img.rows / 2.0f);
+    Mat rot_mat = getRotationMatrix2D(center, angle_deg, 1.0);
+    Mat rotated;
+    warpAffine(img, rotated, rot_mat, img.size(), INTER_LINEAR, BORDER_REFLECT);
+    return rotated;
 }
 
 // Create SIFT detector tuned for upscaled 160x160 fingerprint sensor images
@@ -90,7 +100,7 @@ static Ptr<SIFT> create_tuned_sift() {
     return SIFT::create(
         150,    // nfeatures: cap to top 150 strongest keypoints to prevent ratio dilution
         4,      // nOctaveLayers: scale levels suited for 160x160 ridge patterns
-        0.04,   // contrastThreshold: reject low-contrast background/sensor noise
+        0.035,  // contrastThreshold: sensitive to diagonal/rotated ridges while rejecting noise
         12,     // edgeThreshold: reject sensor boundary artifacts while keeping ridge endings
         1.6     // sigma: standard SIFT base blur for stable gradient orientations
     );
@@ -171,8 +181,9 @@ static double estimate_baseline(libusb_device_handle *dev,
     return (baseline_samples > 0) ? baseline_stddev / baseline_samples : 100.0;
 }
 
-// Capture images with finger-on/off detection and in-loop quality gate (for enrollment — 5 distinct touches)
-static bool capture_usb_images(vector<Mat>& out_images, int required_touches, int timeout_sec) {
+// Capture images with finger-on/off detection, in-loop quality gate, and live stage progress
+static bool capture_usb_images(vector<Mat>& out_images, int required_touches, int timeout_sec,
+                               sift_enroll_progress_cb progress_cb, void* user_data) {
     ScopedUsbDevice usb(0x04f3, 0x0c4f);
     if (!usb.is_valid()) return false;
 
@@ -183,8 +194,8 @@ static bool capture_usb_images(vector<Mat>& out_images, int required_touches, in
 
     unsigned char buffer[12800];
     double baseline = estimate_baseline(usb.dev, buffer, sizeof(buffer));
-    double touch_on_threshold = max(250.0, baseline * 2.2);
-    double touch_off_threshold = min(touch_on_threshold * 0.6, baseline * 1.4);
+    double touch_on_threshold = max(240.0, baseline * 2.1);
+    double touch_off_threshold = min(touch_on_threshold * 0.65, baseline * 1.45);
 
     Ptr<SIFT> sift = create_tuned_sift();
     int touches = 0;
@@ -203,7 +214,7 @@ static bool capture_usb_images(vector<Mat>& out_images, int required_touches, in
                     if (stddev < touch_off_threshold) {
                         waiting_for_off = false;
                         touch_settling = false;
-                        this_thread::sleep_for(chrono::milliseconds(80));
+                        this_thread::sleep_for(chrono::milliseconds(60));
                     }
                 } else if (stddev > touch_on_threshold) {
                     if (!touch_settling) {
@@ -215,15 +226,17 @@ static bool capture_usb_images(vector<Mat>& out_images, int required_touches, in
                     Mat norm_img;
                     normalize(raw, norm_img, 0, 255, NORM_MINMAX, CV_8UC1);
 
-                    // Parity with elan_enroll.py: verify quality before counting touch
                     Mat clean_img = process_image(norm_img);
                     vector<KeyPoint> kp;
                     Mat des;
                     sift->detectAndCompute(clean_img, noArray(), kp, des);
 
-                    if (!des.empty() && kp.size() >= 8 && compute_quality(clean_img, kp) >= 2.5) {
+                    if (!des.empty() && kp.size() >= 8 && compute_quality(clean_img, kp) >= 2.2) {
                         out_images.push_back(norm_img.clone());
                         touches++;
+                        if (progress_cb) {
+                            progress_cb(touches, user_data);
+                        }
                         waiting_for_off = true;
                         touch_settling = false;
                     }
@@ -235,33 +248,43 @@ static bool capture_usb_images(vector<Mat>& out_images, int required_touches, in
         this_thread::sleep_for(chrono::milliseconds(25));
     }
 
-    return touches > 0;
+    return touches >= 5;
 }
 
-// Check if a single 8-bit sensor frame matches the enrolled super-template
+// Check if a single 8-bit sensor frame matches the enrolled super-template.
+// Evaluates 0 deg first (~3ms) for instant unlock, then tests rotated angles
+// (-20, +20, -38, +38, -55, +55 deg) so a finger rotated by 20-60 deg aligns cleanly.
 static bool match_single_frame(const Mat& norm_img, const Mat& saved_des, Ptr<SIFT>& sift, BFMatcher& matcher) {
-    Mat clean_img = process_image(norm_img);
-    vector<KeyPoint> keypoints;
-    Mat descriptors;
-    sift->detectAndCompute(clean_img, noArray(), keypoints, descriptors);
+    static const double angles[] = {0.0, -20.0, 20.0, -38.0, 38.0, -55.0, 55.0};
 
-    if (descriptors.empty() || keypoints.size() < 6) return false;
-    if (compute_quality(clean_img, keypoints) < 2.0) return false;
+    for (double angle : angles) {
+        Mat rotated = rotate_sensor_frame(norm_img, angle);
+        Mat clean_img = process_image(rotated);
+        vector<KeyPoint> keypoints;
+        Mat descriptors;
+        sift->detectAndCompute(clean_img, noArray(), keypoints, descriptors);
 
-    vector<vector<DMatch>> knn_matches;
-    matcher.knnMatch(descriptors, saved_des, knn_matches, 2);
+        if (descriptors.empty() || keypoints.size() < 6) continue;
+        if (compute_quality(clean_img, keypoints) < 1.8) continue;
 
-    int good_matches = 0;
-    for (size_t i = 0; i < knn_matches.size(); i++) {
-        if (knn_matches[i].size() >= 2) {
-            if (knn_matches[i][0].distance < 0.75f * knn_matches[i][1].distance) {
-                good_matches++;
+        vector<vector<DMatch>> knn_matches;
+        matcher.knnMatch(descriptors, saved_des, knn_matches, 2);
+
+        int good_matches = 0;
+        for (size_t i = 0; i < knn_matches.size(); i++) {
+            if (knn_matches[i].size() >= 2) {
+                if (knn_matches[i][0].distance < 0.77f * knn_matches[i][1].distance) {
+                    good_matches++;
+                }
             }
         }
-    }
 
-    double match_ratio = (double)good_matches / (double)keypoints.size();
-    return (good_matches >= 5 && match_ratio >= 0.08) || good_matches >= 8;
+        double match_ratio = (double)good_matches / (double)keypoints.size();
+        if ((good_matches >= 5 && match_ratio >= 0.06) || good_matches >= 7) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ===================== SIFT ENGINE API =====================
@@ -270,12 +293,12 @@ extern "C" {
 
 int sift_engine_init(void) { return 1; }
 
-int sift_engine_enroll(unsigned char** out_data) {
+int sift_engine_enroll(unsigned char** out_data, sift_enroll_progress_cb progress_cb, void* user_data) {
     if (!out_data) return 0;
     *out_data = nullptr;
 
     vector<Mat> images;
-    if (!capture_usb_images(images, 5, 30)) return 0;
+    if (!capture_usb_images(images, 8, 60, progress_cb, user_data)) return 0;
 
     Ptr<SIFT> sift = create_tuned_sift();
     Mat super_des;
@@ -289,14 +312,11 @@ int sift_engine_enroll(unsigned char** out_data) {
 
         if (des.empty() || kp.size() < 8) continue;
 
-        // Quality gate: reject partial touches with low spatial coverage
         double quality = compute_quality(clean_img, kp);
-        if (quality < 2.5) continue;
+        if (quality < 2.2) continue;
 
-        // Deduplicate descriptors against existing super-template.
-        // Threshold 180.0 prevents near-duplicate descriptors of the same ridge
-        // feature across touches from entering super_des and causing Lowe's ratio
-        // test (d0 < ratio * d1) to self-reject when d0 and d1 are the same minutia.
+        // Deduplicate descriptors against existing super-template (threshold 200.0f
+        // prevents cross-touch self-cancellation in Lowe's ratio test)
         if (super_des.empty()) {
             super_des = des.clone();
         } else {
@@ -305,7 +325,7 @@ int sift_engine_enroll(unsigned char** out_data) {
                 Mat single_des = des.row(i);
                 vector<DMatch> matches;
                 dedupe_matcher.match(single_des, super_des, matches);
-                if (matches.empty() || matches[0].distance > 180.0f) {
+                if (matches.empty() || matches[0].distance > 200.0f) {
                     new_unique_des.push_back(single_des);
                 }
             }
@@ -360,7 +380,7 @@ int sift_engine_verify(const unsigned char* saved_data, int data_size) {
 
     unsigned char buffer[12800];
     double baseline = estimate_baseline(usb.dev, buffer, sizeof(buffer));
-    double touch_threshold = max(250.0, baseline * 2.2);
+    double touch_threshold = max(240.0, baseline * 2.1);
 
     Ptr<SIFT> sift = create_tuned_sift();
     BFMatcher matcher(NORM_L2);
@@ -369,8 +389,9 @@ int sift_engine_verify(const unsigned char* saved_data, int data_size) {
     bool touch_detected = false;
     int frames_checked = 0;
 
-    // Instant streaming verification: matches on the very first settled frame (~0.1-0.2s)
-    // and continues checking rapid frames while the finger stays on the sensor.
+    // Continuous multi-angle streaming verification:
+    // Matches on the first settled frame (~0.1-0.2s), tests +/-20, +/-38, +/-55 deg rotations,
+    // and allows finger repositioning during the touch window without premature exit.
     while (chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - start_time).count() < 10) {
         if (read_sensor_frame(usb.dev, buffer, sizeof(buffer))) {
             Mat raw(80, 80, CV_16UC1, buffer);
@@ -379,7 +400,6 @@ int sift_engine_verify(const unsigned char* saved_data, int data_size) {
             if (is_valid_raw_frame(raw, stddev) && stddev > touch_threshold) {
                 if (!touch_detected) {
                     touch_detected = true;
-                    // Brief 25ms settle so initial finger contact flattens
                     this_thread::sleep_for(chrono::milliseconds(25));
                     continue;
                 }
@@ -389,14 +409,15 @@ int sift_engine_verify(const unsigned char* saved_data, int data_size) {
                 frames_checked++;
 
                 if (match_single_frame(norm_img, saved_des_cloned, sift, matcher)) {
-                    return 1; // Instant unlock on first matching frame!
+                    return 1; // Instant unlock!
                 }
 
-                if (frames_checked >= 5) break;
+                if (frames_checked >= 20) break;
                 this_thread::sleep_for(chrono::milliseconds(25));
                 continue;
-            } else if (touch_detected && frames_checked > 0) {
-                break; // Finger lifted after attempt
+            } else {
+                touch_detected = false;
+                if (frames_checked >= 12) break;
             }
         }
         this_thread::sleep_for(chrono::milliseconds(25));
